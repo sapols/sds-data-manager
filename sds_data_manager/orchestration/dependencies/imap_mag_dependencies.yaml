@@ -128,6 +128,11 @@
       data_type: l1b
       descriptor: norm-magi
       required: false
+      # Also pull the previous day's normal-mode L1B so L1C can inherit a timeline
+      # across the day boundary when the current day has no usable NM (MAG SDC Data
+      # Validation cases T017/T018). [past, future] days (past is negative);
+      # the next day is not needed.
+      date_range: ["-1d", "0d"]
     - source: mag
       data_type: l1b
       descriptor: burst-magi
@@ -152,6 +157,11 @@
       data_type: l1b
       descriptor: norm-mago
       required: false
+      # Also pull the previous day's normal-mode L1B so L1C can inherit a timeline
+      # across the day boundary when the current day has no usable NM (MAG SDC Data
+      # Validation cases T017/T018). [past, future] days (past is negative);
+      # the next day is not needed.
+      date_range: ["-1d", "0d"]
     - source: mag
       data_type: l1b
       descriptor: burst-mago
