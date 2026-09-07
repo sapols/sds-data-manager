@@ -198,6 +198,8 @@
       descriptor: norm-mago
       major_version: 1
 
+# custom_behavior/mag.py queries SPICE for this job's day plus the 30-minute
+# buffer that MAG science files carry on either side (issue 1112).
 (l1d, norm-srf):
   partition: daily
   inputs:

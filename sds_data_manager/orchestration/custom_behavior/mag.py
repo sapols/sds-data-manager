@@ -190,3 +190,25 @@ class MagL1CJob(imap_job.IMAPJobHandler):
         )
 
         return science_processing_inputs
+
+
+# MAG science files up to L1C carry 30 minutes of data on either side of
+# their day, and MAG L1D transforms vectors across that whole span.
+MAG_DAY_BUFFER = datetime.timedelta(minutes=30)
+
+
+@JobBuilderRegistry.register("mag", "l1d", "norm-srf")
+class MagL1DJob(imap_job.IMAPJobHandler):
+    """Query SPICE for MAG's buffered day rather than the bare partition window.
+
+    MAG L1D rotates vectors from the 30-minute buffers on either side of the
+    day (sds-data-manager issue 1112), so its attitude and ephemeris kernels
+    must cover that span. The generic handler queries SPICE for the partition
+    window only, so a kernel covering just a buffer was never delivered.
+    """
+
+    def get_spice_file_inputs(self, session, target_start, target_end):
+        """Return the SPICE files covering the day and its buffers."""
+        return super().get_spice_file_inputs(
+            session, target_start - MAG_DAY_BUFFER, target_end + MAG_DAY_BUFFER
+        )

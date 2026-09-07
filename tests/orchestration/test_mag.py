@@ -1,4 +1,4 @@
-"""Test the MAG L1C custom job handler.
+"""Test the MAG custom job handlers in custom_behavior/mag.py.
 
 MAG L1C continues the previous day's L1C timeline across the day boundary
 (imap_processing#2925), so its job pulls the previous day's L1C - its own
@@ -12,8 +12,15 @@ should:
   - wait (report a pending dependency) while the previous day's L1C is in
     flight or expected, and stop waiting once it exists, provably has no
     data, or its job already finished
+
+MAG L1D transforms vectors from the 30-minute buffers on either side of the
+day (sds-data-manager issue 1112), so MagL1DJob should:
+  - query SPICE from 30 minutes before the day to 30 minutes after it
+  - receive kernels that cover only a buffer, which the partition-window
+    query leaves out
 """
 
+import datetime
 from unittest.mock import PropertyMock, patch
 
 import pytest
@@ -31,23 +38,28 @@ from dagster._core.remote_origin import (
     RemoteRepositoryOrigin,
 )
 
+from sds_data_manager.orchestration import imap_job, spice
 from sds_data_manager.orchestration.custom_behavior.mag import (
     FINAL_RETRY_NUMBER,
     MagL1CJob,
+    MagL1DJob,
 )
 from sds_data_manager.orchestration.dagster_utilities import (
     parse_dates_from_partition_key,
 )
 from sds_data_manager.orchestration.imap_dagster import job_handlers
+from sds_data_manager.orchestration.types import DependencyNode, ProcessingJobNode
+from tests.orchestration.conftest import _insert_spice_file
 
 TARGET_DAY = 2
 TARGET_PARTITION = "daily_2026-01-02T00:00:00_to_2026-01-03T00:00:00"
 NORM_MAGO_L1C_JOB = "mag_l1c_normmago_processing_job"
 NORM_MAGI_L1C_JOB = "mag_l1c_normmagi_processing_job"
+NORM_SRF_L1D_JOB = "mag_l1d_normsrf_processing_job"
 
 
-def _mag_l1c_job(dagster_job_name: str):
-    """Look up the registered MAG L1C job handler by Dagster job name."""
+def _registered_mag_job(dagster_job_name: str):
+    """Look up a registered MAG job handler by Dagster job name."""
     job = next(
         (j for j in job_handlers if j.dagster_job_name == dagster_job_name),
         None,
@@ -161,13 +173,13 @@ def test_mag_l1c_registered(dagster_job_name):
     Without matching keys the L1C jobs silently fall back to the generic
     IMAPJobHandler and never receive the previous day's L1C.
     """
-    job = _mag_l1c_job(dagster_job_name)
+    job = _registered_mag_job(dagster_job_name)
     assert isinstance(job, MagL1CJob)
 
 
 def test_mag_l1c_adds_previous_day_l1c(ephemeral_instance):
     """The previous day's L1C is delivered; the current day's own is not."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
 
     _materialize_current_day_l1b(ephemeral_instance, TARGET_DAY)
     _materialize(
@@ -201,7 +213,7 @@ def test_mag_l1c_adds_previous_day_l1c(ephemeral_instance):
 
 def test_mag_l1c_never_uses_its_own_day(ephemeral_instance):
     """A reprocessing run must not be fed the current day's own earlier L1C."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
 
     _materialize_current_day_l1b(ephemeral_instance, TARGET_DAY)
     # The current day's own L1C already exists (as it would during
@@ -225,7 +237,7 @@ def test_mag_l1c_never_uses_its_own_day(ephemeral_instance):
 
 def test_mag_l1c_proceeds_without_previous_day(ephemeral_instance):
     """With no previous day L1C at all, the job runs with the current day alone."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
 
     _materialize_current_day_l1b(ephemeral_instance, TARGET_DAY)
 
@@ -247,7 +259,7 @@ def test_mag_l1c_proceeds_without_previous_day(ephemeral_instance):
 )
 def test_mag_l1c_waits_while_previous_day_l1c_runs(ephemeral_instance, status):
     """An in-flight run for the previous day's partition means wait."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     _add_run(
@@ -263,7 +275,7 @@ def test_mag_l1c_waits_while_previous_day_l1c_runs(ephemeral_instance, status):
 
 def test_mag_l1c_waits_while_previous_day_backfill_runs(ephemeral_instance):
     """An in-flight reprocessing-backfill run for the previous day also waits."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     _add_run(
@@ -280,7 +292,7 @@ def test_mag_l1c_waits_while_previous_day_backfill_runs(ephemeral_instance):
 
 def test_mag_l1c_waits_for_expected_previous_day_l1c(ephemeral_instance):
     """Previous-day L1Bs exist but no L1C and no finished run: still coming."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     _materialize_current_day_l1b(ephemeral_instance, TARGET_DAY - 1)
@@ -290,7 +302,7 @@ def test_mag_l1c_waits_for_expected_previous_day_l1c(ephemeral_instance):
 
 def test_mag_l1c_no_wait_when_previous_day_l1c_exists(ephemeral_instance):
     """An existing previous-day L1C is delivered, not waited on."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     _materialize_current_day_l1b(ephemeral_instance, TARGET_DAY - 1)
@@ -311,7 +323,7 @@ def test_mag_l1c_day_before_previous_does_not_satisfy_the_wait(ephemeral_instanc
     an off-by-one window would let day N-2's partition satisfy (or block)
     decisions about day N-1.
     """
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     _materialize_current_day_l1b(ephemeral_instance, TARGET_DAY - 1)
@@ -327,7 +339,7 @@ def test_mag_l1c_day_before_previous_does_not_satisfy_the_wait(ephemeral_instanc
 
 def test_mag_l1c_no_wait_when_previous_day_has_no_data(ephemeral_instance):
     """A previous day with no L1B data has no L1C to wait for."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     assert job._previous_day_l1c_pending(context) is False
@@ -335,7 +347,7 @@ def test_mag_l1c_no_wait_when_previous_day_has_no_data(ephemeral_instance):
 
 def test_mag_l1c_no_wait_before_any_partitions_exist(ephemeral_instance):
     """With no daily partitions registered at all, there is nothing to wait for."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     bare_instance = DagsterInstance.ephemeral()
     context = build_asset_context(
         partition_key=TARGET_PARTITION, instance=bare_instance
@@ -346,7 +358,7 @@ def test_mag_l1c_no_wait_before_any_partitions_exist(ephemeral_instance):
 
 def test_mag_l1c_ignores_other_jobs_runs(ephemeral_instance):
     """Another instrument's run on the previous day's partition is not ours."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     _add_run(
@@ -362,7 +374,7 @@ def test_mag_l1c_ignores_other_jobs_runs(ephemeral_instance):
 
 def test_mag_l1c_ignores_own_day_run(ephemeral_instance):
     """A run for the current day's own partition is not the previous day's."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     _add_run(
@@ -378,7 +390,7 @@ def test_mag_l1c_ignores_own_day_run(ephemeral_instance):
 
 def test_mag_l1c_no_wait_after_previous_day_job_finished(ephemeral_instance):
     """A finished previous-day run (skip or failure) means no L1C is coming."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     _materialize_current_day_l1b(ephemeral_instance, TARGET_DAY - 1)
@@ -395,7 +407,7 @@ def test_mag_l1c_no_wait_after_previous_day_job_finished(ephemeral_instance):
 
 def test_mag_l1c_finished_backfill_run_also_counts(ephemeral_instance):
     """A finished reprocessing-backfill run for the previous day also counts."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     _materialize_current_day_l1b(ephemeral_instance, TARGET_DAY - 1)
@@ -413,7 +425,7 @@ def test_mag_l1c_finished_backfill_run_also_counts(ephemeral_instance):
 
 def test_mag_l1c_stops_waiting_on_final_retry(ephemeral_instance):
     """The wait gives up on the last retry instead of failing the run."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     # The previous day's L1C is expected, so the job would normally wait.
@@ -430,7 +442,7 @@ def test_mag_l1c_stops_waiting_on_final_retry(ephemeral_instance):
 
 def test_mag_l1c_still_waits_on_upstream_ancestors(ephemeral_instance):
     """The base class's ancestor check still applies to MAG L1C runs."""
-    job = _mag_l1c_job(NORM_MAGO_L1C_JOB)
+    job = _registered_mag_job(NORM_MAGO_L1C_JOB)
     context = _pending_context(ephemeral_instance)
 
     # An in-flight run materializing an upstream MAG L1B asset, as a
@@ -445,3 +457,98 @@ def test_mag_l1c_still_waits_on_upstream_ancestors(ephemeral_instance):
     )
 
     assert job._check_for_running_dependencies(context) is True
+
+
+def test_mag_l1d_registered():
+    """The registry key must match the YAML descriptor exactly.
+
+    Without a matching key the L1D job silently falls back to the generic
+    IMAPJobHandler and queries SPICE for the bare partition window.
+    """
+    job = _registered_mag_job(NORM_SRF_L1D_JOB)
+    assert isinstance(job, MagL1DJob)
+
+
+def test_mag_l1d_queries_spice_across_the_buffered_day():
+    """The SPICE query starts 30 minutes before the day and ends 30 minutes after."""
+    job = _registered_mag_job(NORM_SRF_L1D_JOB)
+    target_start, target_end = parse_dates_from_partition_key(TARGET_PARTITION)
+
+    with patch.object(
+        spice, "get_upstream_dependency_inputs_spice", return_value=["kernel.bc"]
+    ) as query:
+        result = job.get_spice_file_inputs(None, target_start, target_end)
+
+    assert result == ["kernel.bc"]
+    query.assert_called_once_with(
+        job.job_config.spice_types,
+        target_start - datetime.timedelta(minutes=30),
+        target_end + datetime.timedelta(minutes=30),
+    )
+
+
+def _pointing_attitude_only_l1d_job(handler_class):
+    """Build a MAG L1D handler whose only SPICE input is pointing_attitude.
+
+    The real L1D job declares ten kernel types and the SPICE query returns
+    nothing unless every one of them is present, so the kernel-selection
+    test uses a one-kernel-type job to keep the database setup to the
+    kernels under test.
+    """
+    return handler_class(
+        ProcessingJobNode(
+            source="mag",
+            data_type="l1d",
+            descriptor="norm-srf",
+            partition="daily",
+            inputs=[
+                DependencyNode(
+                    source="pointing_attitude",
+                    data_type="spice",
+                    descriptor="historical",
+                )
+            ],
+            outputs=[
+                DependencyNode(source="mag", data_type="l1d", descriptor="norm-srf")
+            ],
+        )
+    )
+
+
+def test_mag_l1d_receives_kernels_covering_only_the_buffers(mock_db_session):
+    """Kernels for the neighboring days are delivered to L1D but not generically.
+
+    Each pointing_attitude kernel here covers exactly one day. The generic
+    partition-window query is satisfied by the day's own kernel, while the
+    buffered query also needs the last 30 minutes of the day before and the
+    first 30 minutes of the day after.
+    """
+    target_start, target_end = parse_dates_from_partition_key(TARGET_PARTITION)
+    one_day = datetime.timedelta(days=1)
+    j2000 = spice._seconds_since_j2000
+    day_before = "imap_dps_2026_001_2026_002_001.ah.bc"
+    day_of = "imap_dps_2026_002_2026_003_001.ah.bc"
+    day_after = "imap_dps_2026_003_2026_004_001.ah.bc"
+    _insert_spice_file(
+        mock_db_session,
+        day_before,
+        [[j2000(target_start - one_day), j2000(target_start)]],
+    )
+    _insert_spice_file(
+        mock_db_session, day_of, [[j2000(target_start), j2000(target_end)]]
+    )
+    _insert_spice_file(
+        mock_db_session,
+        day_after,
+        [[j2000(target_end), j2000(target_end + one_day)]],
+    )
+
+    generic_job = _pointing_attitude_only_l1d_job(imap_job.IMAPJobHandler)
+    assert generic_job.get_spice_file_inputs(
+        mock_db_session, target_start, target_end
+    ) == [day_of]
+
+    mag_job = _pointing_attitude_only_l1d_job(MagL1DJob)
+    assert set(
+        mag_job.get_spice_file_inputs(mock_db_session, target_start, target_end)
+    ) == {day_before, day_of, day_after}
