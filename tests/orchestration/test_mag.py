@@ -1,4 +1,4 @@
-"""Test the MAG L1C custom job handler.
+"""Test the MAG custom job handlers.
 
 MAG L1C continues the previous day's L1C timeline across the day boundary
 (imap_processing#2925), so its job pulls the previous day's L1C - its own
@@ -14,7 +14,8 @@ should:
     data, or its job already finished
 """
 
-from unittest.mock import PropertyMock, patch
+import datetime
+from unittest.mock import Mock, PropertyMock, patch
 
 import pytest
 from dagster import (
@@ -30,20 +31,115 @@ from dagster._core.remote_origin import (
     RemoteJobOrigin,
     RemoteRepositoryOrigin,
 )
+from imap_data_access import processing_input
 
+from sds_data_manager.orchestration import imap_job, spice
 from sds_data_manager.orchestration.custom_behavior.mag import (
     FINAL_RETRY_NUMBER,
     MagL1CJob,
+    MagL1DJob,
 )
 from sds_data_manager.orchestration.dagster_utilities import (
     parse_dates_from_partition_key,
 )
 from sds_data_manager.orchestration.imap_dagster import job_handlers
+from tests.orchestration.conftest import _insert_spice_file
 
 TARGET_DAY = 2
 TARGET_PARTITION = "daily_2026-01-02T00:00:00_to_2026-01-03T00:00:00"
 NORM_MAGO_L1C_JOB = "mag_l1c_normmago_processing_job"
 NORM_MAGI_L1C_JOB = "mag_l1c_normmagi_processing_job"
+
+
+def test_mag_l1d_registered():
+    assert [j.dagster_job_name for j in job_handlers if isinstance(j, MagL1DJob)] == [
+        "mag_l1d_normsrf_processing_job"
+    ]
+
+
+@pytest.mark.parametrize(
+    "partition",
+    [
+        TARGET_PARTITION,
+        "daily_2026-01-01T00:00:00_to_2026-01-02T00:00:00",
+        "daily_2026-12-31T00:00:00_to_2027-01-01T00:00:00",
+        "daily_2028-03-01T00:00:00_to_2028-03-02T00:00:00",
+    ],
+)
+def test_mag_l1d_pads_only_spice_inputs(partition):
+    job = next(j for j in job_handlers if isinstance(j, MagL1DJob))
+    start, end = parse_dates_from_partition_key(partition)
+    context, session = Mock(), Mock()
+    science_input = processing_input.ScienceInput(
+        "imap_mag_l1c_norm-mago_20260102_v001.0001.cdf"
+    )
+    kernels = ["naif0012.tls", "imap_sclk_0189.tsc"]
+    with (
+        patch.object(
+            job, "get_science_files_inputs", return_value=[science_input]
+        ) as science_query,
+        patch.object(
+            job, "get_ancillary_files_inputs", return_value=[]
+        ) as ancillary_query,
+        patch.object(job, "get_spin_files_inputs", return_value=[]) as spin_query,
+        patch.object(
+            spice, "get_upstream_dependency_inputs_spice", return_value=kernels
+        ) as spice_query,
+    ):
+        inputs = job.get_dependencies(session, context, start, end)
+
+    science_query.assert_called_once_with(context, start, end)
+    ancillary_query.assert_called_once_with(session, start, end)
+    spin_query.assert_called_once_with(session, start, end)
+    spice_query.assert_called_once_with(
+        job.job_config.spice_types,
+        start - datetime.timedelta(minutes=30),
+        end + datetime.timedelta(minutes=30),
+    )
+    assert [path.name for path in inputs.get_file_paths(data_type="spice")] == kernels
+
+
+def test_mag_l1d_selects_spice_kernels_on_both_sides_of_midnight(mock_db_session):
+    """The real metakernel query must include kernels needed only by the buffers."""
+    job = next(j for j in job_handlers if isinstance(j, MagL1DJob))
+    start, end = parse_dates_from_partition_key(TARGET_PARTITION)
+    start_et = spice._seconds_since_j2000(start)
+    end_et = spice._seconds_since_j2000(end)
+    kernels = [
+        "imap_2026_001_2026_002_001.ah.bc",
+        "imap_2026_002_2026_003_001.ah.bc",
+        "imap_2026_003_2026_004_001.ah.bc",
+    ]
+    for filename, interval in zip(
+        kernels,
+        [[start_et - 1800, start_et], [start_et, end_et], [end_et, end_et + 1800]],
+        strict=True,
+    ):
+        _insert_spice_file(mock_db_session, filename, [interval])
+
+    with patch.object(job.job_config, "spice_types", ["attitude_history"]):
+        unpadded = imap_job.IMAPJobHandler.get_spice_file_inputs(
+            job, mock_db_session, start, end
+        )
+        padded = job.get_spice_file_inputs(mock_db_session, start, end)
+
+    assert unpadded == [kernels[1]]
+    assert set(padded) == set(kernels)
+
+
+def test_mag_l1d_missing_spice_uses_existing_dependency_error():
+    job = next(j for j in job_handlers if isinstance(j, MagL1DJob))
+    start, end = parse_dates_from_partition_key(TARGET_PARTITION)
+    with (
+        patch.object(spice, "get_upstream_dependency_inputs_spice", return_value=None),
+        pytest.raises(
+            imap_job.MissingDependenciesError, match="Missing SPICE files"
+        ) as error,
+    ):
+        job.get_spice_file_inputs(Mock(), start, end)
+
+    assert "2026-01-01 23:30:00" in str(error.value)
+    assert "2026-01-03 00:30:00" in str(error.value)
 
 
 def _mag_l1c_job(dagster_job_name: str):
