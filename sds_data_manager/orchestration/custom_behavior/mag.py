@@ -21,7 +21,14 @@ FINAL_RETRY_NUMBER = 10
 
 @JobBuilderRegistry.register("mag", "l1d", "norm-srf")
 class MagL1DJob(imap_job.IMAPJobHandler):
-    """Query SPICE for the padded MAG L1D processing window."""
+    """Query SPICE for the padded MAG L1D processing window.
+
+    MAG L1D truncates its timeline to the science day before querying spin
+    phase, so the spin query window is the day itself, and the run is skipped
+    until spin files cover the whole of it.
+    """
+
+    require_spin_coverage = True
 
     def get_spice_file_inputs(self, session, target_start, target_end):
         """Include the 30-minute buffer on either side of the science day."""

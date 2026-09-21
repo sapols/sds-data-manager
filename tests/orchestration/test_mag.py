@@ -15,7 +15,9 @@ should:
 
 MAG L1D rotates vectors across the 30-minute buffers on either side of the
 day (sds-data-manager issue 1112), so MagL1DJob should query SPICE for the
-day plus both buffers and receive kernels that only cover a buffer.
+day plus both buffers and receive kernels that only cover a buffer. It also
+truncates its timeline to the science day before querying spin phase, so it
+should skip the day until spin files cover all of it.
 """
 
 import datetime
@@ -46,12 +48,15 @@ from sds_data_manager.orchestration.dagster_utilities import (
     parse_dates_from_partition_key,
 )
 from sds_data_manager.orchestration.imap_dagster import job_handlers
-from tests.orchestration.conftest import _insert_spice_file
+from tests.orchestration.conftest import _insert_spice_file, _insert_spin_file
 
 TARGET_DAY = 2
 TARGET_PARTITION = "daily_2026-01-02T00:00:00_to_2026-01-03T00:00:00"
 NORM_MAGO_L1C_JOB = "mag_l1c_normmago_processing_job"
 NORM_MAGI_L1C_JOB = "mag_l1c_normmagi_processing_job"
+SPIN_PARTITION = "daily_2026-09-10T00:00:00_to_2026-09-11T00:00:00"
+PARTIAL_DAY_SPIN_FILE = "imap_2026_252_2026_253_01.spin"
+FULL_DAY_SPIN_FILE = "imap_2026_253_2026_254_01.spin"
 
 
 def _mag_l1c_job(dagster_job_name: str):
@@ -497,3 +502,59 @@ def test_mag_l1d_receives_kernels_covering_only_the_buffers(mock_db_session):
 
     assert generic == [day_of]
     assert set(buffered) == {before, day_of, after}
+
+
+def _mag_l1d_job():
+    """Look up the registered MAG L1D job handler."""
+    return next(j for j in job_handlers if isinstance(j, MagL1DJob))
+
+
+def _insert_partial_day_spin_file(session):
+    """Insert the spin file that ends where the target day begins."""
+    _insert_spin_file(
+        session,
+        PARTIAL_DAY_SPIN_FILE,
+        start_date=datetime.datetime(2026, 9, 9),
+        end_date=datetime.datetime(2026, 9, 10),
+    )
+
+
+def test_mag_l1d_skips_when_spin_files_do_not_cover_the_day(mock_db_session):
+    """A spin file ending at the day's start leaves L1D without coverage."""
+    job = _mag_l1d_job()
+    target_start, target_end = parse_dates_from_partition_key(SPIN_PARTITION)
+    _insert_partial_day_spin_file(mock_db_session)
+
+    with pytest.raises(imap_job.MissingDependenciesError):
+        job.get_spin_files_inputs(mock_db_session, target_start, target_end)
+
+
+def test_mag_l1d_uses_every_spin_file_covering_the_day(mock_db_session):
+    """Once the day's own spin file lands, both overlapping files are delivered."""
+    job = _mag_l1d_job()
+    target_start, target_end = parse_dates_from_partition_key(SPIN_PARTITION)
+    _insert_partial_day_spin_file(mock_db_session)
+    _insert_spin_file(
+        mock_db_session,
+        FULL_DAY_SPIN_FILE,
+        start_date=datetime.datetime(2026, 9, 10),
+        end_date=datetime.datetime(2026, 9, 11),
+    )
+
+    spin_files = job.get_spin_files_inputs(mock_db_session, target_start, target_end)
+
+    assert set(spin_files) == {PARTIAL_DAY_SPIN_FILE, FULL_DAY_SPIN_FILE}
+
+
+def test_spin_coverage_is_not_required_by_default(mock_db_session):
+    """Handlers that do not require spin coverage keep the partial file."""
+    job = _mag_l1d_job()
+    target_start, target_end = parse_dates_from_partition_key(SPIN_PARTITION)
+    _insert_partial_day_spin_file(mock_db_session)
+
+    with patch.object(job, "require_spin_coverage", False):
+        spin_files = job.get_spin_files_inputs(
+            mock_db_session, target_start, target_end
+        )
+
+    assert spin_files == [PARTIAL_DAY_SPIN_FILE]

@@ -120,6 +120,11 @@ class BatchJobSubmit:
 class IMAPJobHandler:
     """Handle IMAP job dependencies and submission."""
 
+    # When True, spin files that leave part of the window uncovered skip the
+    # job until the missing spin file arrives, rather than running a job that
+    # the processing code will reject.
+    require_spin_coverage: bool = False
+
     def __init__(self, job: ProcessingJobNode):
         """Initialize handler with job node and process dependencies.
 
@@ -864,7 +869,10 @@ class IMAPJobHandler:
     ) -> list[str]:
         """Return the spin file dependencies needed to cover a time range."""
         spin_files = spin.get_upstream_dependency_inputs_spin(
-            target_start.replace(hour=0, minute=0, second=0), target_end, False, session
+            target_start.replace(hour=0, minute=0, second=0),
+            target_end,
+            require_coverage=self.require_spin_coverage,
+            open_session=session,
         )
         if not spin_files and self.job_config.spin_input.required:
             raise MissingDependenciesError(
