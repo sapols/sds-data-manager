@@ -15,7 +15,8 @@ should:
 
 MAG L1D rotates vectors across the 30-minute buffers on either side of the
 day (sds-data-manager issue 1112), so MagL1DJob should query SPICE for the
-day plus both buffers and receive kernels that only cover a buffer.
+day plus both buffers and receive kernels that only cover a buffer. Its spin
+inputs must also cover the whole nominal day before processing starts.
 """
 
 import datetime
@@ -46,7 +47,7 @@ from sds_data_manager.orchestration.dagster_utilities import (
     parse_dates_from_partition_key,
 )
 from sds_data_manager.orchestration.imap_dagster import job_handlers
-from tests.orchestration.conftest import _insert_spice_file
+from tests.orchestration.conftest import _insert_spice_file, _insert_spin_file
 
 TARGET_DAY = 2
 TARGET_PARTITION = "daily_2026-01-02T00:00:00_to_2026-01-03T00:00:00"
@@ -473,6 +474,37 @@ def test_mag_l1d_queries_spice_across_the_buffered_day():
         target_start - datetime.timedelta(minutes=30),
         target_end + datetime.timedelta(minutes=30),
     )
+
+
+def test_mag_l1d_requires_complete_spin_coverage(mock_db_session):
+    """An overlapping spin file alone must not start MAG L1D processing."""
+    job = next(j for j in job_handlers if isinstance(j, MagL1DJob))
+    target_start, target_end = parse_dates_from_partition_key(TARGET_PARTITION)
+    previous_spin = "imap_2026_001_2026_002_01.spin"
+    current_spin = "imap_2026_002_2026_003_01.spin"
+
+    _insert_spin_file(
+        mock_db_session,
+        previous_spin,
+        start_date=target_start - datetime.timedelta(days=1),
+        end_date=target_start,
+    )
+
+    with pytest.raises(imap_job.MissingDependenciesError, match="spin"):
+        job.get_spin_files_inputs(mock_db_session, target_start, target_end)
+
+    _insert_spin_file(
+        mock_db_session,
+        current_spin,
+        start_date=target_start,
+        end_date=target_end,
+    )
+
+    spin_files = job.get_spin_files_inputs(mock_db_session, target_start, target_end)
+    assert set(spin_files) == {
+        previous_spin,
+        current_spin,
+    }
 
 
 def test_mag_l1d_receives_kernels_covering_only_the_buffers(mock_db_session):

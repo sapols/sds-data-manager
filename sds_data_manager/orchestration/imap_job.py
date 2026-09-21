@@ -860,11 +860,18 @@ class IMAPJobHandler:
         return anc_processing_inputs
 
     def get_spin_files_inputs(
-        self, session, target_start: datetime.datetime, target_end: datetime.datetime
+        self,
+        session,
+        target_start: datetime.datetime,
+        target_end: datetime.datetime,
+        require_coverage: bool = False,
     ) -> list[str]:
         """Return the spin file dependencies needed to cover a time range."""
         spin_files = spin.get_upstream_dependency_inputs_spin(
-            target_start.replace(hour=0, minute=0, second=0), target_end, False, session
+            start_date=target_start.replace(hour=0, minute=0, second=0),
+            end_date=target_end,
+            require_coverage=require_coverage,
+            open_session=session,
         )
         if not spin_files and self.job_config.spin_input.required:
             raise MissingDependenciesError(
