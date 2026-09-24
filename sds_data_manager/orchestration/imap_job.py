@@ -606,7 +606,9 @@ class IMAPJobHandler:
                 # Now we loop through each partition that we received new data for, and
                 # determine if we need to start it again.
                 for target_partition in target_partitions:
-                    # Check if this partition has already been run successfully
+                    # Check if this partition has already been run successfully.
+                    # A run that skipped for missing dependencies also succeeds,
+                    # so it must have produced output as well to count as done.
                     runs = context.instance.get_runs(
                         filters=RunsFilter(
                             job_name=self.dagster_job_name,
@@ -615,10 +617,13 @@ class IMAPJobHandler:
                         ),
                         limit=1,  # Limit to 1 since we only care about existence
                     )
+                    done = bool(runs) and dagster_utilities.partition_materialized(
+                        context, self.job_config.outputs, target_partition
+                    )
 
-                    # If this has never been run,
+                    # If this has never been done,
                     # or we always trigger from this dependency
-                    if (dep_name in self.triggering_input_names) or not runs:
+                    if (dep_name in self.triggering_input_names) or not done:
                         run_key = "_".join(
                             [
                                 self.job_config.to_dagster_name(),
@@ -637,7 +642,7 @@ class IMAPJobHandler:
                             partition_key=target_partition, run_key=run_key
                         )
 
-                    elif runs and (dep_name not in self.triggering_input_names):
+                    elif done and (dep_name not in self.triggering_input_names):
                         context.log.info(
                             """"We have already materialized something like this,
                             and this dependency does not trigger new processing."""
@@ -864,7 +869,7 @@ class IMAPJobHandler:
     ) -> list[str]:
         """Return the spin file dependencies needed to cover a time range."""
         spin_files = spin.get_upstream_dependency_inputs_spin(
-            target_start.replace(hour=0, minute=0, second=0), target_end, False, session
+            target_start, target_end, self.job_config.spin_input.required, session
         )
         if not spin_files and self.job_config.spin_input.required:
             raise MissingDependenciesError(
