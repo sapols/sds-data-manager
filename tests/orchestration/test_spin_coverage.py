@@ -9,12 +9,13 @@ import datetime
 from collections import namedtuple
 
 import pytest
+from dagster import AssetMaterialization, DagsterRunStatus, build_sensor_context
 
 from sds_data_manager.orchestration import imap_job
 from sds_data_manager.orchestration.dagster_utilities import (
     parse_dates_from_partition_key,
 )
-from sds_data_manager.orchestration.imap_dagster import job_handlers
+from sds_data_manager.orchestration.imap_dagster import defs, job_handlers
 from sds_data_manager.orchestration.spin import (
     SPIN_GAP_TOLERANCE,
     verify_spin_coverage,
@@ -109,6 +110,73 @@ def test_pointing_job_does_not_need_coverage_before_its_pointing(mock_db_session
     assert job.get_spin_files_inputs(mock_db_session, target_start, target_end) == [
         exact_pointing.file_path
     ]
+
+
+def test_spin_arrival_retries_a_partition_that_never_produced_output(
+    mock_db_session, ephemeral_instance
+):
+    """Hi L1B does not trigger from spin, yet a partition that only skipped reruns."""
+    job = _job("hi", "l1b", "45sensor-de")
+    sensor = defs.get_sensor_def(f"{job.job_config.to_dagster_name()}_kickoff_sensor")
+    partition = "repoint2_2026-01-02T00:00:00_to_2026-01-02T23:59:59"
+
+    # A run that skipped for missing dependencies ends in SUCCESS without output
+    ephemeral_instance.create_run_for_job(
+        defs.resolve_job_def(job.dagster_job_name),
+        status=DagsterRunStatus.SUCCESS,
+        tags={"dagster/partition": partition},
+    )
+    _insert_spin_file(
+        mock_db_session,
+        "imap_2026_002_2026_002_01.spin",
+        start_date=datetime.datetime(2026, 1, 2, 6),
+        end_date=datetime.datetime(2026, 1, 2, 18),
+    )
+
+    run_requests = list(sensor(build_sensor_context(instance=ephemeral_instance)))
+    assert [request.partition_key for request in run_requests] == [partition]
+
+    # Once the partition has produced output, a new spin file does not rerun it
+    ephemeral_instance.report_runless_asset_event(
+        AssetMaterialization(
+            asset_key=job.job_config.outputs[0].to_dagster_asset(),
+            partition=partition,
+        )
+    )
+    _insert_spin_file(
+        mock_db_session,
+        "imap_2026_002_2026_002_02.spin",
+        upload_time=1,
+        start_date=datetime.datetime(2026, 1, 2, 6),
+        end_date=datetime.datetime(2026, 1, 2, 18),
+    )
+
+    run_requests = list(sensor(build_sensor_context(instance=ephemeral_instance)))
+    assert run_requests == []
+
+    # A failed run that left partial output is still retried, as before
+    failed_partition = "repoint3_2026-01-03T00:00:00_to_2026-01-03T23:59:59"
+    ephemeral_instance.create_run_for_job(
+        defs.resolve_job_def(job.dagster_job_name),
+        status=DagsterRunStatus.FAILURE,
+        tags={"dagster/partition": failed_partition},
+    )
+    ephemeral_instance.report_runless_asset_event(
+        AssetMaterialization(
+            asset_key=job.job_config.outputs[0].to_dagster_asset(),
+            partition=failed_partition,
+        )
+    )
+    _insert_spin_file(
+        mock_db_session,
+        "imap_2026_003_2026_003_01.spin",
+        upload_time=2,
+        start_date=datetime.datetime(2026, 1, 3, 6),
+        end_date=datetime.datetime(2026, 1, 3, 18),
+    )
+
+    run_requests = list(sensor(build_sensor_context(instance=ephemeral_instance)))
+    assert [request.partition_key for request in run_requests] == [failed_partition]
 
 
 def test_verify_spin_coverage_tolerates_the_seam_between_files():
