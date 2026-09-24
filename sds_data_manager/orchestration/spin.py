@@ -5,7 +5,7 @@ import logging
 from contextlib import nullcontext
 from os.path import basename
 
-from sqlalchemy import and_, desc, func
+from sqlalchemy import desc, func
 from sqlalchemy.orm import aliased
 
 from sds_data_manager.lambda_code.SDSCode.database import database as db
@@ -105,63 +105,56 @@ def get_spin_files(
 ) -> list:
     """Get spin input.
 
-    Query the spin table for the given date range and get latest version.
+    Query the spin table for the latest version of each file, then keep the
+    files overlapping the given time range.
 
     Parameters
     ----------
     session : orm session
         Database session.
     start_date : datetime
-        Start date to find dependent files with.
+        Start of the time range to find spin files for.
     end_date : datetime
-        End date to find dependent files with.
+        End of the time range to find spin files for.
 
     Returns
     -------
     list
-        List of SpinFiles records with file_path, start_date, end_date, version.
+        SpinFiles records with file_path, start_date, end_date and version,
+        oldest ingested first.
     """
     spin = aliased(models.SpinFiles)
 
-    # Define the row_number() window function
+    # Versions of a file share its name apart from the version suffix. Their
+    # coverage can differ, so the name is what identifies them.
+    series = func.regexp_replace(spin.file_path, r"_\d+\.spin.*$", "")
     row_number = (
         func.row_number()
-        .over(
-            partition_by=(spin.start_date, spin.end_date), order_by=desc(spin.version)
-        )
+        .over(partition_by=series, order_by=desc(spin.version))
         .label("row_num")
     )
+    latest = session.query(
+        spin.file_path,
+        spin.start_date,
+        spin.end_date,
+        spin.version,
+        spin.ingestion_date,
+        row_number,
+    ).subquery()
 
-    # Build the subquery with row numbers
-    subquery = (
-        session.query(
-            spin.file_path,
-            spin.start_date,
-            spin.end_date,
-            spin.version,
-            row_number,
-            spin.ingestion_date,
-        )
-        .filter(
-            and_(
-                spin.start_date <= end_date,
-                spin.end_date >= start_date,
-            )
-        )
-        .subquery()
-    )
-
-    # Outer query to select only latest version per start/end date
     records = (
         session.query(
-            subquery.c.file_path,
-            subquery.c.start_date,
-            subquery.c.end_date,
-            subquery.c.version,
+            latest.c.file_path,
+            latest.c.start_date,
+            latest.c.end_date,
+            latest.c.version,
         )
-        .filter(subquery.c.row_num == 1)
-        # Order by ingestion date, oldest first
-        .order_by(subquery.c.ingestion_date)
+        .filter(
+            latest.c.row_num == 1,
+            latest.c.start_date <= end_date,
+            latest.c.end_date >= start_date,
+        )
+        .order_by(latest.c.ingestion_date)
         .all()
     )
 

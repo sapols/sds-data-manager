@@ -4,7 +4,7 @@ import csv
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import boto3
@@ -300,26 +300,63 @@ def index_spice_file(s3_key: str):
     clear_ephemeral_storage(spice_file)
 
 
-def index_spin_file(s3_key: Path):
-    """Insert spin file metadata into spin database table.
+def get_spin_file_coverage(spin_file: Path) -> tuple[datetime, datetime]:
+    """Return the first spin start and the end of the last spin in a spin table.
+
+    Parameters
+    ----------
+    spin_file : Path
+        Local path of the spin table csv.
+
+    Returns
+    -------
+    tuple[datetime, datetime]
+        Coverage start and end in UTC.
+    """
+    with open(spin_file) as file:
+        rows = list(csv.DictReader(file))
+    start_date = parse_datetime(rows[0]["spin_start_utc"])
+    end_date = parse_datetime(rows[-1]["spin_start_utc"]) + timedelta(
+        seconds=float(rows[-1]["spin_period_sec"])
+    )
+    return start_date, end_date
+
+
+def index_spin_file(s3_key: str):
+    """Insert or update spin file metadata in the spin database table.
+
+    Coverage is read from the spin table rows rather than from the day-of-year
+    range in the filename, so dependency checks can work at spin precision.
 
     Parameters
     ----------
     s3_key: str
         S3 path of the spin file.
     """
+    spin_file = download_from_s3(s3_key)
+    start_date, end_date = get_spin_file_coverage(spin_file)
+    clear_ephemeral_storage(spin_file)
+
+    spin_obj = SPICEFilePath(os.path.basename(s3_key))
+    params = {
+        "file_path": s3_key,
+        "start_date": start_date,
+        "end_date": end_date,
+        "version": spin_obj.spice_metadata["version"],
+        "ingestion_date": get_file_ingestion_date(s3_key),
+    }
     with db.Session() as session:
-        spin_obj = SPICEFilePath(os.path.basename(s3_key))
-        spin_metadata = spin_obj.spice_metadata
-        params = {
-            "file_path": s3_key,
-            "start_date": spin_metadata["start_date"],
-            "end_date": spin_metadata["end_date"],
-            "version": spin_metadata["version"],
-            "ingestion_date": get_file_ingestion_date(s3_key),
-        }
-        spin_table = models.SpinFiles(**params)
-        session.add(spin_table)
+        # Re-indexing a file refreshes its coverage without changing its
+        # ingestion date, so sensors do not see it as a new file.
+        stmt = (
+            insert(models.SpinFiles)
+            .values(params)
+            .on_conflict_do_update(
+                index_elements=["file_path"],
+                set_={"start_date": start_date, "end_date": end_date},
+            )
+        )
+        session.execute(stmt)
         session.commit()
 
 

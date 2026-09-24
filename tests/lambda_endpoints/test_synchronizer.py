@@ -1,6 +1,7 @@
 """Testing the database synchronizer."""
 
 import datetime
+from pathlib import Path
 
 from sds_data_manager.lambda_code.SDSCode.database import models, synchronizer
 
@@ -159,7 +160,15 @@ def test_synchronizer_spin_file_added(session, s3_client):
     cleanup_bucket(s3_client)
 
     filepath = "imap/spice/spin/imap_2026_267_2026_267_01.spin.csv"
-    s3_client.put_object(Bucket="test-data-bucket", Key=filepath, Body=b"")
+    spin_file = (
+        Path(__file__).parents[1]
+        / "test-data"
+        / "test_spice_files"
+        / "imap_2026_267_2026_267_01.spin.csv"
+    )
+    s3_client.put_object(
+        Bucket="test-data-bucket", Key=filepath, Body=spin_file.read_bytes()
+    )
 
     with session.begin():
         nfiles = session.query(models.SpinFiles).count()
@@ -173,8 +182,9 @@ def test_synchronizer_spin_file_added(session, s3_client):
 
     item = files[0]
     assert item.file_path == filepath
-    assert item.start_date == datetime.datetime(2026, 9, 24)
-    assert item.end_date == datetime.datetime(2026, 9, 24)
+    # Coverage is read from the spin rows: first spin start to last spin end
+    assert item.start_date == datetime.datetime(2026, 9, 24, 14, 1, 41)
+    assert item.end_date == datetime.datetime(2026, 9, 24, 16, 41, 2)
     assert item.version == "01"
 
 
