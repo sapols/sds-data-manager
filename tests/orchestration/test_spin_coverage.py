@@ -63,6 +63,37 @@ def _insert(session, record: SpinRecord):
     )
 
 
+@pytest.mark.parametrize("product", [("mag", "l1d", "norm-srf"), ("swe", "l2", "sci")])
+def test_daily_job_waits_for_the_spin_file_starting_on_its_day(
+    mock_db_session, product
+):
+    """A daily job is missing spin until a file dated on its day exists."""
+    job = _job(*product)
+    target_start, target_end = parse_dates_from_partition_key(DAY_PARTITION)
+
+    _insert(mock_db_session, SEPT_9_TO_10)
+    with pytest.raises(imap_job.MissingDependenciesError, match="spin"):
+        job.get_spin_files_inputs(mock_db_session, target_start, target_end)
+
+    _insert(mock_db_session, SEPT_10_TO_11)
+    spin_files = job.get_spin_files_inputs(mock_db_session, target_start, target_end)
+    assert set(spin_files) == {SEPT_9_TO_10.file_path, SEPT_10_TO_11.file_path}
+
+
+def test_pointing_job_waits_for_the_spin_file_starting_the_next_day(mock_db_session):
+    """Filename dates are day-granular, so a pointing needs the next day's file."""
+    job = _job("hi", "l1b", "45sensor-de")
+    target_start, target_end = parse_dates_from_partition_key(POINTING_PARTITION)
+
+    _insert(mock_db_session, SEPT_9_TO_10)
+    with pytest.raises(imap_job.MissingDependenciesError, match="spin"):
+        job.get_spin_files_inputs(mock_db_session, target_start, target_end)
+
+    _insert(mock_db_session, SEPT_10_TO_11)
+    spin_files = job.get_spin_files_inputs(mock_db_session, target_start, target_end)
+    assert set(spin_files) == {SEPT_9_TO_10.file_path, SEPT_10_TO_11.file_path}
+
+
 def test_verify_spin_coverage_longer_file_spans_shorter_ones():
     """A longer file covers the window despite shorter files sorted around it."""
     records = [
