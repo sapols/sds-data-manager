@@ -864,7 +864,10 @@ class IMAPJobHandler:
     ) -> list[str]:
         """Return the spin file dependencies needed to cover a time range."""
         spin_files = spin.get_upstream_dependency_inputs_spin(
-            target_start.replace(hour=0, minute=0, second=0), target_end, False, session
+            target_start.replace(hour=0, minute=0, second=0),
+            target_end,
+            self.job_config.spin_input.required,
+            session,
         )
         if not spin_files and self.job_config.spin_input.required:
             raise MissingDependenciesError(
