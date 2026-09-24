@@ -306,6 +306,10 @@ def test_s3_spin_files(session, s3_client, events_client):
     assert spin_table_rows[0].file_path == (
         "imap/spice/spin/imap_2026_267_2026_267_01.spin.csv"
     )
+    # Coverage comes from the first spin start and the last spin start plus
+    # its period, not from the day-of-year range in the filename.
+    assert spin_table_rows[0].start_date == datetime(2026, 9, 24, 14, 1, 41)
+    assert spin_table_rows[0].end_date == datetime(2026, 9, 24, 16, 41, 2)
 
     # Second spin file ingestion
     spin_file2_event = put_local_file_in_bucket(
@@ -321,6 +325,13 @@ def test_s3_spin_files(session, s3_client, events_client):
         "imap/spice/spin/imap_2026_267_2026_267_02.spin.csv"
     )
     assert spin_table_rows[1].version == "02"
+    assert spin_table_rows[1].start_date == datetime(2026, 9, 24, 12, 58, 2)
+    assert spin_table_rows[1].end_date == datetime(2026, 9, 25, 0, 0, 2, 290)
+
+    # Re-indexing a file updates its row instead of failing on the primary key
+    spice_indexer.lambda_handler(spin_file1_event, None)
+    spin_table_rows = session.execute(query).all()
+    assert len(spin_table_rows) == 2
 
 
 @patch(

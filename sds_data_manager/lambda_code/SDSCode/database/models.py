@@ -279,7 +279,7 @@ class SpinFiles(Base):
     __tablename__ = "spin_files"
     # Spin number will be unique
     file_path = Column(String, nullable=False, primary_key=True)
-    # start and end date from file name
+    # first spin start and last spin end, read from the rows when indexed
     start_date = Column(DateTime, nullable=False)
     end_date = Column(DateTime, nullable=False)
     version = Column(String(2), nullable=False)
