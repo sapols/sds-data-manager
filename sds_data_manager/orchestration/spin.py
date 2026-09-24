@@ -16,17 +16,24 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+# A file's end is its last spin start plus that spin's estimated period, so
+# adjacent files overlap or gap by a few tens of milliseconds. A real gap is
+# at least one spin, about fifteen seconds.
+SPIN_GAP_TOLERANCE = datetime.timedelta(seconds=1)
+
+
 def verify_spin_coverage(
     records: list,
     start_date: datetime,
     end_date: datetime,
 ) -> bool:
-    """Verify that spin files cover the entire date range without gaps.
+    """Verify that spin files cover the entire time range without gaps.
 
-    Spin files have start_date and end_date ranges. This function verifies:
-    1. First record covers or starts before the input start_date
-    2. No gaps exist between consecutive record ranges
-    3. Last record covers up to or past the input end_date
+    A spin file covers its first spin start through the end of its last spin,
+    as recorded when the file was indexed. This function verifies:
+    1. First record starts at or before the input start_date
+    2. Each record starts no later than the coverage accumulated so far
+    3. Accumulated coverage reaches the input end_date
 
     If gaps are found, they are logged at INFO level.
 
@@ -35,9 +42,9 @@ def verify_spin_coverage(
     records : list
         List of SpinFiles records with file_path, start_date, end_date.
     start_date : datetime
-        Expected coverage start date.
+        Expected coverage start time.
     end_date : datetime
-        Expected coverage end date.
+        Expected coverage end time.
 
     Returns
     -------
@@ -48,52 +55,36 @@ def verify_spin_coverage(
         logger.info(f"No spin files found for {start_date} to {end_date}")
         return False
 
-    # Sort records by start_date
     sorted_records = sorted(records, key=lambda r: r.start_date)
 
-    # Check if first record covers or starts before input start_date
     if sorted_records[0].start_date.replace(
         tzinfo=datetime.timezone.utc
     ) > start_date.replace(tzinfo=datetime.timezone.utc):
-        gap_start = start_date
-        gap_end = sorted_records[0].start_date - datetime.timedelta(days=1)
         logger.info(
-            f"Spin coverage gap at start: Gap from {gap_start.strftime('%Y%m%d')} "
-            f"to {gap_end.strftime('%Y%m%d')}"
+            f"Spin coverage gap at start: {start_date} to "
+            f"{sorted_records[0].start_date}"
         )
         return False
 
-    # Check for gaps between consecutive records
-    for i in range(len(sorted_records) - 1):
-        current_end = sorted_records[i].end_date
-        next_start = sorted_records[i + 1].start_date
-
-        # Gap exists if next_start is after current_end
-        # (next_start must be on the same day as current_end or overlap)
-        if next_start > current_end:
-            gap_start = current_end + datetime.timedelta(days=1)
-            gap_end = next_start - datetime.timedelta(days=1)
+    covered_through = sorted_records[0].end_date
+    for record in sorted_records[1:]:
+        if record.start_date > covered_through + SPIN_GAP_TOLERANCE:
             logger.info(
-                f"Spin coverage gap between records: Gap from "
-                f"{gap_start.strftime('%Y%m%d')} to {gap_end.strftime('%Y%m%d')}"
+                f"Spin coverage gap between files: {covered_through} to "
+                f"{record.start_date}"
             )
             return False
+        covered_through = max(covered_through, record.end_date)
 
-    # Check if last record covers past input end_date
-    if sorted_records[-1].end_date.replace(
+    if covered_through.replace(tzinfo=datetime.timezone.utc) < end_date.replace(
         tzinfo=datetime.timezone.utc
-    ) < end_date.replace(tzinfo=datetime.timezone.utc):
-        gap_start = sorted_records[-1].end_date + datetime.timedelta(days=1)
-        gap_end = end_date
-        logger.info(
-            f"Spin coverage gap at end: Gap from {gap_start.strftime('%Y%m%d')} "
-            f"to {gap_end.strftime('%Y%m%d')}"
-        )
+    ):
+        logger.info(f"Spin coverage gap at end: {covered_through} to {end_date}")
         return False
 
     logger.info(
-        f"Spin coverage verified for {start_date.strftime('%Y%m%d')} to "
-        f"{end_date.strftime('%Y%m%d')}: {len(records)} file(s) cover range"
+        f"Spin coverage verified for {start_date} to {end_date}: "
+        f"{len(records)} file(s) cover range"
     )
     return True
 
