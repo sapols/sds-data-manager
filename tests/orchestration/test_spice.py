@@ -163,3 +163,58 @@ def test_get_upstream_dependency_inputs_spin(mock_db_session):
         "imap_2026_126_2026_128_01.spin",
         "imap_2026_120_2026_127_01.spin",
     ]
+
+
+def test_spin_versions_are_recognized_by_name(mock_db_session):
+    """Versions of a file are recognized by name although their coverage differs."""
+    # Coverage of the two versions of imap_2025_316_2025_317, read from their rows
+    _insert_spin_file(
+        mock_db_session,
+        "imap_2025_316_2025_317_01.spin",
+        upload_time=1,
+        start_date=datetime.datetime(2025, 11, 12, 18, 58, 2, 884841),
+        end_date=datetime.datetime(2025, 11, 13, 5, 52, 19, 139218),
+    )
+    _insert_spin_file(
+        mock_db_session,
+        "imap_2025_316_2025_317_02.spin",
+        upload_time=2,
+        start_date=datetime.datetime(2025, 11, 12, 18, 58, 2, 904417),
+        end_date=datetime.datetime(2025, 11, 13, 5, 52, 19, 159182),
+    )
+
+    spin_files = get_upstream_dependency_inputs_spin(
+        datetime.datetime(2025, 11, 13),
+        datetime.datetime(2025, 11, 14),
+        False,
+        mock_db_session,
+    )
+
+    assert spin_files == ["imap_2025_316_2025_317_02.spin"]
+
+
+def test_superseded_spin_version_is_never_returned(mock_db_session):
+    """A newer version outside the range does not resurrect the old one inside it."""
+    _insert_spin_file(
+        mock_db_session,
+        "imap_2025_316_2025_317_01.spin",
+        upload_time=1,
+        start_date=datetime.datetime(2025, 11, 12, 18, 58, 2),
+        end_date=datetime.datetime(2025, 11, 13, 5, 52, 19),
+    )
+    _insert_spin_file(
+        mock_db_session,
+        "imap_2025_316_2025_317_02.spin",
+        upload_time=2,
+        start_date=datetime.datetime(2025, 11, 12, 18, 58, 2),
+        end_date=datetime.datetime(2025, 11, 12, 23, 59, 59),
+    )
+
+    spin_files = get_upstream_dependency_inputs_spin(
+        datetime.datetime(2025, 11, 13),
+        datetime.datetime(2025, 11, 14),
+        False,
+        mock_db_session,
+    )
+
+    assert spin_files is None
